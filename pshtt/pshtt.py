@@ -12,6 +12,7 @@ import json
 import os
 import logging
 import sys
+import datetime
 import codecs
 import OpenSSL
 
@@ -26,8 +27,14 @@ except ImportError:
     from urllib2 import URLError
 
 import sslyze
-from sslyze.server_connectivity_tester import ServerConnectivityTester, ServerConnectivityError
-import sslyze.synchronous_scanner
+from sslyze import (
+    Scanner,
+    ServerConnectivityTester,
+    ServerNetworkLocationViaDirectConnection,
+    ServerScanRequest,
+)
+from sslyze.errors import ConnectionToServerFailed
+from sslyze.plugins.scan_commands import ScanCommand
 
 # We're going to be making requests with certificate validation
 # disabled.  Commented next line due to pylint warning that urllib3 is
@@ -568,19 +575,22 @@ def https_check(endpoint):
     # remove the https:// from prefix for sslyze
     try:
         hostname = endpoint.url[8:]
-        server_tester = ServerConnectivityTester(hostname=hostname, port=443)
-        server_info = server_tester.perform()
+        server_location = ServerNetworkLocationViaDirectConnection.with_ip_address_lookup(
+            hostname=hostname, port=443
+        )
+        server_tester = ServerConnectivityTester()
+        server_info = server_tester.perform(server_location)
         endpoint.live = True
-        ip = server_info.ip_address
+        ip = server_location.ip_address
         if endpoint.ip is None:
             endpoint.ip = ip
         else:
             if endpoint.ip != ip:
                 utils.debug("{}: Endpoint IP is already {}, but requests IP is {}.".format(endpoint.url, endpoint.ip, ip))
-        if server_info.client_auth_requirement.name == 'REQUIRED':
+        if server_info.tls_probing_result.client_auth_requirement.name == 'REQUIRED':
             endpoint.https_client_auth_required = True
             logging.warning("{}: Client Authentication REQUIRED".format(endpoint.url))
-    except ServerConnectivityError as err:
+    except ConnectionToServerFailed as err:
         endpoint.live = False
         endpoint.https_valid = False
         logging.exception("{}: Error in sslyze server connectivity check when connecting to {}".format(endpoint.url, err.server_info.hostname))
@@ -594,14 +604,21 @@ def https_check(endpoint):
 
     try:
         cert_plugin_result = None
-        command = sslyze.plugins.certificate_info_plugin.CertificateInfoScanCommand(ca_file=CA_FILE)
-        scanner = sslyze.synchronous_scanner.SynchronousScanner()
-        cert_plugin_result = scanner.run_scan_command(server_info, command)
+        command = ScanCommand.CERTIFICATE_INFO
+        scanner = Scanner()
+        scan_request = ServerScanRequest(server_info=server_info, scan_commands=[command])
+        scanner.queue_scan(scan_request)
+        # Retrieve results from generator object
+        scan_result = [x for x in scanner.get_results()][0]
+        cert_plugin_result = scan_result.scan_commands_results[ScanCommand.CERTIFICATE_INFO]
     except Exception as err:
         try:
             if "timed out" in str(err):
                 logging.exception("{}: Retrying sslyze scanner certificate plugin.".format(endpoint.url))
-                cert_plugin_result = scanner.run_scan_command(server_info, command)
+                scanner.queue_scan(scan_request)
+                # Retrieve results from generator object
+                scan_result = [x for x in scanner.get_results()][0]
+                cert_plugin_result = scan_result.scan_commands_results[ScanCommand.CERTIFICATE_INFO]
             else:
                 logging.exception("{}: Unknown exception in sslyze scanner certificate plugin.".format(endpoint.url))
                 utils.debug("{}: {}".format(endpoint.url, err))
@@ -623,7 +640,7 @@ def https_check(endpoint):
         public_trust = True
         custom_trust = True
         public_not_trusted_string = ""
-        validation_results = cert_plugin_result.path_validation_result_list
+        validation_results = cert_plugin_result.certificate_deployments[0].path_validation_results
         for result in validation_results:
             if result.was_validation_successful:
                 # We're assuming that it is trusted to start with
@@ -654,88 +671,51 @@ def https_check(endpoint):
         logging.exception("{}: Unknown exception examining trust.".format(endpoint.url))
         utils.debug("{}: Unknown exception examining trust: {}".format(endpoint.url, err))
 
-    try:
-        cert_response = cert_plugin_result.as_text()
-    except AttributeError:
-        logging.exception("{}: Known error in sslyze 1.X with EC public keys. See https://github.com/nabla-c0d3/sslyze/issues/215".format(endpoint.url))
-        return None
-    except Exception as err:
-        endpoint.unknown_error = True
-        logging.exception("{}: Unknown exception in cert plugin.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
-        return
-
-    # Debugging
-    # for msg in cert_response:
-    #     print(msg)
-
     # Default endpoint assessments to False until proven True.
     endpoint.https_expired_cert = False
     endpoint.https_self_signed_cert = False
     endpoint.https_bad_chain = False
     endpoint.https_bad_hostname = False
 
-    # STORE will be either "Mozilla" or "Custom"
-    # depending on what the user chose.
+    cert_chain = cert_plugin_result.certificate_deployments[0].received_certificate_chain
+    leaf_cert = cert_chain[0]
 
-    # A certificate can have multiple issues.
-    for msg in cert_response:
+    # Check for leaf certificate expiration/self-signature.
+    if leaf_cert.not_valid_after < datetime.datetime.now():
+        endpoint.https_expired_cert = True
 
-        # Check for missing SAN.
-        if (
-            (("DNS Subject Alternative Names") in msg) and
-            (("[]") in msg)
-        ):
-            endpoint.https_bad_hostname = True
+    # Check to see if the cert is self-signed
+    if leaf_cert.issuer is leaf_cert.subject:
+        endpoint.https_self_signed_cert = True
 
-        # Check for certificate expiration.
-        if (
-            (STORE in msg) and
-            (("FAILED") in msg) and
-            (("certificate has expired") in msg)
-        ):
-            endpoint.https_expired_cert = True
-
-        # Check to see if the cert is self-signed
-        if (
-            (STORE in msg) and
-            (("FAILED") in msg) and
-            (("self signed certificate") in msg)
-        ):
-            endpoint.https_self_signed_cert = True
-
-        # Check to see if there is a bad chain
-
-        # NOTE: If this is the only flag that's set, it's probably
-        # an incomplete chain
-        # If this isnt the only flag that is set, it's might be
-        # because there is another error. More debugging would
-        # need to be done at this point, but not through sslyze
-        # because sslyze doesn't have enough granularity
-
-        if (
-            (STORE in msg) and
-            (("FAILED") in msg) and
-            (
-                (("unable to get local issuer certificate") in msg) or
-                (("self signed certificate") in msg)
-            )
-        ):
+    # Check certificate chain
+    # NOTE: If this is the only flag that's set, it's probably
+    # an incomplete chain
+    # If this isnt the only flag that is set, it's might be
+    # because there is another error. More debugging would
+    # need to be done at this point, but not through sslyze
+    # because sslyze doesn't have enough granularity
+    for cert in cert_chain[1:]:
+        # Check for certificate expiration
+        if cert.not_valid_after < datetime.datetime.now():
             endpoint.https_bad_chain = True
 
-        # Check for whether the hostname validates.
-        if (
-            (("Hostname Validation") in msg) and
-            (("FAILED") in msg) and
-            (("Certificate does NOT match") in msg)
-        ):
-            endpoint.https_bad_hostname = True
+        # Check to see if the cert is self-signed
+        if cert.issuer is (cert.subject or None):
+            endpoint.https_bad_chain = True
+
+    # If leaf certificate subject does NOT match hostname, bad hostname
+    # NOTE: Since sslyze 3.0.0, ever since JSON output for certinfo,
+    # SAN(s) are checked as part of _certificate_matches_hostname which
+    # called as part of leaf_certificate_subject_matches_hostname
+    if not cert_plugin_result.certificate_deployments[0].leaf_certificate_subject_matches_hostname:
+        endpoint.https_bad_hostname = True
 
     try:
-        endpoint.https_cert_chain_len = len(cert_plugin_result.received_certificate_chain)
+        endpoint.https_cert_chain_len = len(cert_plugin_result.certificate_deployments[0].received_certificate_chain)
         if (
                 endpoint.https_self_signed_cert is False and (
-                    len(cert_plugin_result.received_certificate_chain) < 2
+                    len(cert_plugin_result.certificate_deployments[0].received_certificate_chain) < 2
                 )
         ):
             # *** TODO check that it is not a bad hostname and that the root cert is trusted before suggesting that it is an intermediate cert issue.
