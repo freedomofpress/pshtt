@@ -651,22 +651,68 @@ def https_check(endpoint):
             return
 
     try:
+        # Default endpoint assessments to False until proven True.
+        endpoint.https_expired_cert = False
+        endpoint.https_self_signed_cert = False
+        endpoint.https_bad_chain = False
+        endpoint.https_bad_hostname = False
+
+        # Default trust to Fase until proven True
         public_trust = True
         custom_trust = True
         public_not_trusted_string = ""
-        validation_results = cert_plugin_result.certificate_deployments[0].path_validation_results
-        for result in validation_results:
-            if result.was_validation_successful:
-                # We're assuming that it is trusted to start with
-                pass
-            else:
-                if 'Custom' in result.trust_store.name:
-                    custom_trust = False
+        for certificate_deployment in cert_plugin_result.certificate_deployments:
+            validation_results = certificate_deployment.path_validation_results
+            for result in validation_results:
+                if result.was_validation_successful:
+                    # We're assuming that it is trusted to start with
+                    pass
                 else:
-                    public_trust = False
-                    if len(public_not_trusted_string) > 0:
-                        public_not_trusted_string += ", "
-                    public_not_trusted_string += result.trust_store.name
+                    if 'Custom' in result.trust_store.name:
+                        custom_trust = False
+                    else:
+                        public_trust = False
+                        if len(public_not_trusted_string) > 0:
+                            public_not_trusted_string += ", "
+                        public_not_trusted_string += result.trust_store.name
+
+                if STORE in result.trust_store.name:
+                    cert_chain = result.verified_certificate_chain
+                    leaf_cert = cert_chain[0]
+
+                    # Check for leaf certificate expiration/self-signature.
+                    if leaf_cert.not_valid_after < datetime.datetime.now():
+                        endpoint.https_expired_cert = True
+
+                    # Check to see if the cert is self-signed
+                    if leaf_cert.issuer == leaf_cert.subject:
+                        endpoint.https_self_signed_cert = True
+
+                    # Check certificate chain till the second last element
+                    # The last cert being the root cert is self signed and
+                    # hence the self signed check is not valid
+                    # NOTE: If this is the only flag that's set, it's probably
+                    # an incomplete chain
+                    # If this isn't the only flag that is set, it might be
+                    # because there is another error. More debugging would
+                    # need to be done at this point, but not through sslyze
+                    # because sslyze doesn't have enough granularity
+                    for cert in cert_chain[:-1]:
+                        # Check for certificate expiration
+                        if cert.not_valid_after < datetime.datetime.now():
+                            endpoint.https_bad_chain = True
+
+                        # Check to see if the cert is self-signed
+                        if cert.issuer == cert.subject or not cert.issuer:
+                            endpoint.https_bad_chain = True
+
+                    # If leaf certificate subject does NOT match hostname, bad hostname
+                    # NOTE: Since sslyze 3.0.0, ever since JSON output for certinfo,
+                    # SAN(s) are checked as part of _certificate_matches_hostname which
+                    # called as part of leaf_certificate_subject_matches_hostname
+                    if not certificate_deployment.leaf_certificate_subject_matches_hostname:
+                        endpoint.https_bad_hostname = True
+
         if public_trust:
             logging.warning("{}: Publicly trusted by common trust stores.".format(endpoint.url))
         else:
@@ -682,48 +728,8 @@ def https_check(endpoint):
         endpoint.https_custom_trusted = custom_trust
     except Exception as err:
         # Ignore exception
-        logging.exception("{}: Unknown exception examining trust.".format(endpoint.url))
-        utils.debug("{}: Unknown exception examining trust: {}".format(endpoint.url, err))
-
-    # Default endpoint assessments to False until proven True.
-    endpoint.https_expired_cert = False
-    endpoint.https_self_signed_cert = False
-    endpoint.https_bad_chain = False
-    endpoint.https_bad_hostname = False
-
-    cert_chain = cert_plugin_result.certificate_deployments[0].received_certificate_chain
-    leaf_cert = cert_chain[0]
-
-    # Check for leaf certificate expiration/self-signature.
-    if leaf_cert.not_valid_after < datetime.datetime.now():
-        endpoint.https_expired_cert = True
-
-    # Check to see if the cert is self-signed
-    if leaf_cert.issuer == leaf_cert.subject:
-        endpoint.https_self_signed_cert = True
-
-    # Check certificate chain
-    # NOTE: If this is the only flag that's set, it's probably
-    # an incomplete chain
-    # If this isn't the only flag that is set, it might be
-    # because there is another error. More debugging would
-    # need to be done at this point, but not through sslyze
-    # because sslyze doesn't have enough granularity
-    for cert in cert_chain[1:]:
-        # Check for certificate expiration
-        if cert.not_valid_after < datetime.datetime.now():
-            endpoint.https_bad_chain = True
-
-        # Check to see if the cert is self-signed
-        if cert.issuer == (cert.subject or None):
-            endpoint.https_bad_chain = True
-
-    # If leaf certificate subject does NOT match hostname, bad hostname
-    # NOTE: Since sslyze 3.0.0, ever since JSON output for certinfo,
-    # SAN(s) are checked as part of _certificate_matches_hostname which
-    # called as part of leaf_certificate_subject_matches_hostname
-    if not cert_plugin_result.certificate_deployments[0].leaf_certificate_subject_matches_hostname:
-        endpoint.https_bad_hostname = True
+        logging.exception("{}: Unknown exception examining certificate deployment.".format(endpoint.url))
+        utils.debug("{}: Unknown exception examining certificate deployment: {}".format(endpoint.url, err))
 
     try:
         endpoint.https_cert_chain_len = len(cert_plugin_result.certificate_deployments[0].received_certificate_chain)
@@ -734,7 +740,7 @@ def https_check(endpoint):
         ):
             # *** TODO check that it is not a bad hostname and that the root cert is trusted before suggesting that it is an intermediate cert issue.
             endpoint.https_missing_intermediate_cert = True
-            if(cert_plugin_result.verified_certificate_chain is None):
+            if cert_plugin_result.verified_certificate_chain is None:
                 logging.warning("{}: Untrusted certificate chain, probably due to missing intermediate certificate.".format(endpoint.url))
                 utils.debug("{}: Only {} certificates in certificate chain received.".format(endpoint.url, cert_plugin_result.received_certificate_chain.__len__()))
             elif(custom_trust is True and public_trust is False):
